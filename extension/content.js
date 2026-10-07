@@ -1,5 +1,58 @@
 (function () {
 	"use strict";
+	// Local changes based on theesfeld/CleanX, commit 80fd4db.
+	const Helpers = globalThis.CleanXHelpers;
+	const Core = globalThis.XCountryCore;
+	const CHANNEL = "cleanx-local-v1";
+	let bridgeState = "waiting-session", bridgeRetryAt = 0, bridgeSequence = 0;
+	const bridgePending = new Map();
+	let fetchBusy = false, saveTimer = null, saveChain = Promise.resolve();
+	let followingBusy = false;
+	function postBridge(data) {
+		window.postMessage({channel:CHANNEL,direction:"to-page",...data},location.origin);
+	}
+	function updateLookupStatus() {
+		const el=document.getElementById("xcb-lookup-status");
+		if(!el) return;
+		const messages={ready:"Connected to X", "waiting-session":"Refresh X to connect your session", "rate-limited":"X rate limit: lookups paused", "session-rejected":"X rejected the lookup: refresh or open an About-account page", "endpoint-unavailable":"Endpoint unavailable: open a profile’s About-account view", "network-error":"Network error: waiting to retry", "bridge-timeout":"Connection timed out: refresh X", paused:"Lookups paused"};
+		let text=messages[bridgeState] || "Checking account locations";
+		if(bridgeRetryAt>Date.now()+5000) text+=" · Retry in "+Math.ceil((bridgeRetryAt-Date.now())/60000)+" min";
+		if(el.textContent!==text) el.textContent=text;
+	}
+	window.addEventListener("message",event=> {
+		const m=event.data;
+		if(event.source!==window || event.origin!==location.origin || m?.channel!==CHANNEL || m.direction!=="from-page") return;
+		if(m.type==="status" && typeof m.state==="string" && m.state.length<60) {
+			bridgeState=m.state;
+			if(Number.isFinite(m.retryAt)) bridgeRetryAt=Math.max(bridgeRetryAt,m.retryAt);
+			updateLookupStatus();
+		}
+		if(m.type!=="result") return;
+		const pending=bridgePending.get(m.id);
+		if(!pending || pending.author!==m.author) return;
+		bridgePending.delete(m.id);clearTimeout(pending.timer);
+		if(m.error) {
+			bridgeState=String(m.error).slice(0,60);
+			bridgeRetryAt=Math.max(Date.now()+5000,Number.isFinite(m.retryAt)?m.retryAt:0);
+			updateLookupStatus();pending.reject(new Error(bridgeState));
+		} else if(m.country===null || (typeof m.country==="string" && m.country.length<=100)) {
+			pending.resolve({country:m.country,usernameChanges:Number.isInteger(m.usernameChanges)&&m.usernameChanges>=0?m.usernameChanges:null});
+		} else pending.reject(new Error("Invalid location response"));
+	});
+	function requestAbout(author) {
+		if(!Core.handle(author)) return Promise.reject(new Error("Invalid account handle"));
+		if(Date.now()<bridgeRetryAt) return Promise.reject(new Error(bridgeState));
+		return new Promise((resolve,reject)=> {
+			const id=String(++bridgeSequence);
+			const timer=setTimeout(()=> {bridgePending.delete(id);bridgeState="bridge-timeout";bridgeRetryAt=Date.now()+30000;updateLookupStatus();reject(new Error("Lookup timed out"));},20000);
+			bridgePending.set(id,{author,resolve,reject,timer});
+			postBridge({type:"config",active:true});postBridge({type:"lookup",author,id});
+		});
+	}
+	function currentInfo(author) {
+		const entry=config.knownUsers[author];
+		return Helpers.fresh(entry) ? entry : null;
+	}
 
 	if (!/^https?:\/\/(x|twitter)\.com\//.test(window.location.href)) return;
 
@@ -21,7 +74,7 @@
 		blockedLangs: new Set(), // ← EMPTY
 		blockedRegions: new Set(), // ← EMPTY
 		countryDB: {}, // code -> [usernames]
-		knownUsers: {}, // username -> { accountCountry, accountRegion, usernameChanges, ts }
+		knownUsers: Object.create(null), // username -> { accountCountry, accountRegion, usernameChanges, ts, v }
 		pending: new Set(),
 		filterMode: "block", // "block" | "highlight"
 		filterTotals: defaultTotals(),
@@ -35,33 +88,17 @@
 	let totalsSaveTimer = null;
 	let nextFetchAllowed = 0;
 	const FETCH_GAP_MS = 3500; // throttle outbound requests
-	const RATE_LIMIT_BACKOFF_MS = 2 * 60 * 1000; // back off 2 minutes on 429
+	const RATE_LIMIT_BACKOFF_MS = 15 * 60 * 1000; // minimum backoff; bridge honors Retry-After
 	const UNKNOWN_RETRY_MS = 10 * 60 * 1000; // retry unknowns after 10m
 	const FOLLOW_SCAN_MAX = 800; // limit following scan
-	const FOLLOW_FETCH_DELAY = 500;
-	const PREFETCH_BATCH = 5;
+	const FOLLOW_FETCH_DELAY = 3500;
+	const PREFETCH_BATCH = 1;
 	const PREFETCH_INTERVAL_MS = 4000;
 	const blockStats = { country: {}, lang: {}, region: {} }; // session-only counts
-	let dbPromise = null;
-	const FIELD_TOGGLES = { withAuxiliaryUserLabels: false };
+
 	const BEARER_TOKEN =
 		"AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
-	const ABOUT_QUERY_ID = "XRqGa7EeokUU5kppkh13EA";
-	const GRAPHQL_FEATURES = {
-		hidden_profile_subscriptions_enabled: true,
-		subscriptions_verification_info_is_identity_verified_enabled: true,
-		subscriptions_verification_info_verified_since_enabled: true,
-		responsive_web_graphql_skip_user_profile_image_extensions_enabled: true,
-		responsive_web_graphql_timeline_navigation_enabled: true,
-		responsive_web_graphql_timeline_navigation_enabled_elsewhere: true,
-		responsive_web_enhance_cards_enabled: true,
-		verified_phone_label_enabled: true,
-		creator_subscriptions_tweet_preview_api_enabled: true,
-		highlights_tweets_tab_ui_enabled: true,
-		longform_notetweets_consumption_enabled: true,
-		tweetypie_unmention_optimization_enabled: true,
-		vibe_api_enabled: true,
-	};
+
 
 	// Full country map (unchanged)
 	const COUNTRY_MAP = {
@@ -435,201 +472,50 @@
 		},
 	];
 
-	function load() {
-		const saved = localStorage.getItem(STORAGE_KEY);
-		if (saved) {
-			const parsed = JSON.parse(saved);
-			config.blockedCountries = new Set(parsed.blockedCountries || []);
-			config.blockedLangs = new Set(parsed.blockedLangs || []);
-			config.blockedRegions = new Set(parsed.blockedRegions || []);
-			config.countryDB = parsed.countryDB || {};
-			config.filterMode =
-				parsed.filterMode === "highlight" ? "highlight" : "block";
-			config.filterTotals = {
-				...defaultTotals(),
-				...(parsed.filterTotals || {}),
-			};
-			config.highlightRegionDisplayOnly = Boolean(
-				parsed.highlightRegionDisplayOnly,
-			);
-			config.analytics = {
-				...defaultAnalytics(),
-				...(parsed.analytics || {}),
-			};
-			if (parsed.knownUsers) {
-				config.knownUsers = {};
-				for (const [k, v] of Object.entries(parsed.knownUsers)) {
-					config.knownUsers[k] = {
-						accountCountry: v.accountCountry || null,
-						accountRegion: v.accountRegion || null,
-						usernameChanges:
-							typeof v.usernameChanges === "number"
-								? v.usernameChanges
-								: null,
-						ts: v.ts || 0,
-					};
-				}
-			}
+	async function load() {
+		const stored=await chrome.storage.local.get(STORAGE_KEY);
+		const parsed=stored[STORAGE_KEY];
+		if(!parsed || parsed.schema!==2) return;
+		config.blockedCountries=new Set((parsed.blockedCountries || []).filter(code=>Core.catalog.some(c=>c.type==="country" && c.id===code)));
+		config.blockedRegions=new Set((parsed.blockedRegions || []).filter(value=>typeof value==="string" && value.length<=100));
+		config.blockedLangs=new Set((parsed.blockedLangs || []).filter(value=>typeof value==="string" && value.length<20));
+		config.filterMode=parsed.filterMode==="highlight"?"highlight":"block";
+		config.highlightRegionDisplayOnly=parsed.highlightRegionDisplayOnly===true;
+		config.filterTotals={...defaultTotals(),...(parsed.filterTotals || {}),session:0};
+		config.analytics={...defaultAnalytics(),...(parsed.analytics || {})};
+		config.knownUsers=Helpers.prune(parsed.knownUsers);
+	}
+	function snapshot() {
+		config.knownUsers=Helpers.prune(config.knownUsers);
+		config.countryDB={};
+		for(const [user,entry] of Object.entries(config.knownUsers)) {
+			if(entry.accountCountry) (config.countryDB[entry.accountCountry] ||= []).push(user);
 		}
+		return {schema:2,blockedCountries:[...config.blockedCountries],blockedRegions:[...config.blockedRegions],blockedLangs:[...config.blockedLangs],filterMode:config.filterMode,highlightRegionDisplayOnly:config.highlightRegionDisplayOnly,filterTotals:config.filterTotals,analytics:config.analytics,knownUsers:config.knownUsers};
 	}
 	function save() {
-		localStorage.setItem(
-			STORAGE_KEY,
-			JSON.stringify({
-				blockedCountries: Array.from(config.blockedCountries),
-				blockedLangs: Array.from(config.blockedLangs),
-				blockedRegions: Array.from(config.blockedRegions),
-				countryDB: config.countryDB,
-				filterMode: config.filterMode,
-				filterTotals: config.filterTotals,
-				highlightRegionDisplayOnly: config.highlightRegionDisplayOnly,
-				analytics: config.analytics,
-			}),
-		);
-	}
-
-	function exportDB() {
-		return JSON.stringify(
-			{
-				countryDB: config.countryDB,
-				knownUsers: config.knownUsers,
-				filterTotals: config.filterTotals,
-				highlightRegionDisplayOnly: config.highlightRegionDisplayOnly,
-			},
-			null,
-			2,
-		);
-	}
-
-	function openDB() {
-		if (dbPromise) return dbPromise;
-		dbPromise = new Promise((resolve, reject) => {
-			const req = indexedDB.open("xcb-country-blocker", 2);
-			req.onerror = () => reject(req.error);
-			req.onupgradeneeded = () => {
-				const db = req.result;
-				if (!db.objectStoreNames.contains("known")) {
-					db.createObjectStore("known", { keyPath: "user" });
-				}
-				if (!db.objectStoreNames.contains("stats")) {
-					db.createObjectStore("stats", { keyPath: "id" });
-				}
-			};
-			req.onsuccess = () => resolve(req.result);
-		});
-		return dbPromise;
-	}
-
-	async function loadKnownFromDB() {
-		try {
-			const db = await openDB();
-			const tx = db.transaction("known", "readonly");
-			const store = tx.objectStore("known");
-			const rows = await new Promise((resolve, reject) => {
-				const req = store.getAll();
-				req.onsuccess = () => resolve(req.result || []);
-				req.onerror = () => reject(req.error);
+		clearTimeout(saveTimer);
+		saveTimer=setTimeout(()=> {
+			const data=structuredClone(snapshot());
+			saveChain=saveChain.then(()=>chrome.storage.local.set({[STORAGE_KEY]:data})).catch(()=> {
+				const el=document.getElementById("xcb-status");if(el) el.textContent="Could not save settings. Reopen X and try again.";
 			});
-			config.knownUsers = {};
-			for (const row of rows) {
-				if (!row?.user) continue;
-				config.knownUsers[row.user] = {
-					accountCountry: row.accountCountry || null,
-					accountRegion: row.accountRegion || null,
-					usernameChanges:
-						typeof row.usernameChanges === "number"
-							? row.usernameChanges
-							: null,
-					ts: row.ts || 0,
-				};
-			}
-		} catch (e) {
-			console.warn("[XCB] loadKnownFromDB failed", e);
-		}
+		},250);
 	}
-
-	async function saveKnownToDB(user, data) {
-		try {
-			const db = await openDB();
-			const tx = db.transaction("known", "readwrite");
-			tx.objectStore("known").put({
-				user,
-				accountCountry: data.accountCountry || null,
-				accountRegion: data.accountRegion || null,
-				usernameChanges:
-					typeof data.usernameChanges === "number"
-						? data.usernameChanges
-						: null,
-				ts: data.ts || nowTs(),
-			});
-		} catch (e) {
-			console.warn("[XCB] saveKnownToDB failed", e);
-		}
-	}
-
-	async function loadTotalsFromDB() {
-		try {
-			const db = await openDB();
-			const tx = db.transaction("stats", "readonly");
-			const store = tx.objectStore("stats");
-			const totals = await new Promise((resolve, reject) => {
-				const req = store.get("totals");
-				req.onsuccess = () => resolve(req.result || null);
-				req.onerror = () => reject(req.error);
-			});
-			if (totals) {
-				config.filterTotals = {
-					overall: totals.overall || 0,
-					country: totals.country || {},
-					lang: totals.lang || {},
-					region: totals.region || {},
-					session: totals.session || 0,
-				};
-				filteredCount = totals.session || 0;
-				config.analytics = {
-					...defaultAnalytics(),
-					...(totals.analytics || {}),
-				};
-			}
-		} catch (e) {
-			console.warn("[XCB] loadTotalsFromDB failed", e);
-		} finally {
-			if (!config.filterTotals) config.filterTotals = defaultTotals();
-		}
-	}
-
-	async function saveTotalsToDB() {
-		try {
-			const db = await openDB();
-			const tx = db.transaction("stats", "readwrite");
-			tx.objectStore("stats").put({
-				id: "totals",
-				overall: config.filterTotals.overall || 0,
-				country: config.filterTotals.country || {},
-				lang: config.filterTotals.lang || {},
-				region: config.filterTotals.region || {},
-				session: filteredCount,
-				analytics: config.analytics || defaultAnalytics(),
-				updated: nowTs(),
-			});
-		} catch (e) {
-			console.warn("[XCB] saveTotalsToDB failed", e);
-		}
-	}
-
+	function exportDB() {return JSON.stringify(snapshot(),null,2);}
+	function saveKnownToDB() {save();}
 	function scheduleTotalsSave() {
-		if (totalsSaveTimer) return;
-		totalsSaveTimer = setTimeout(() => {
-			totalsSaveTimer = null;
-			config.filterTotals.session = filteredCount;
-			save();
-			saveTotalsToDB();
-		}, 1000);
+		if(totalsSaveTimer) return;
+		totalsSaveTimer=setTimeout(()=>{totalsSaveTimer=null;config.filterTotals.session=filteredCount;save();},1000);
 	}
-	load();
+
+
+	for(const country of Core.catalog.filter(c=>c.type==="country")) {
+		if(!COUNTRY_MAP[country.label]) COUNTRY_MAP[country.label]=country.id;
+	}
 
 	function normUser(u) {
-		return (u || "").toLowerCase().replace(/^@/, "");
+		return Core.handle(u) || "";
 	}
 
 	function extractUsername(tweet) {
@@ -803,11 +689,11 @@
 		tweet.dataset.xcbOverlayId = id;
 	}
 
-	function renderFooterInfo(tweet, countryCode, usernameChanges) {
+	function renderFooterInfo(tweet, countryCode, usernameChanges, regionName) {
 		const rowId = tweet.dataset.xcbFooterId;
 		const hasCountry = Boolean(countryCode);
 		const hasChanges = Number.isFinite(usernameChanges);
-		if (!hasCountry && !hasChanges) {
+		if (!hasCountry && !hasChanges && !regionName) {
 			if (rowId) {
 				const existing = document.getElementById(rowId);
 				if (existing) existing.remove();
@@ -823,8 +709,9 @@
 				Object.keys(COUNTRY_MAP).find(
 					(name) => COUNTRY_MAP[name] === countryCode,
 				) || countryCode;
-			parts.push(`Country: ${flag} ${fullName}`);
+			parts.push(`Account based in: ${flag} ${fullName}`);
 		}
+		if (!hasCountry && regionName) parts.push(`Account based in: ${regionName} (region only)`);
 		if (hasChanges) {
 			parts.push(`Username changes: ${usernameChanges}`);
 		}
@@ -889,6 +776,12 @@
 				"content-type": "application/json",
 			},
 		});
+		if (resp.status === 429) {
+			bridgeRetryAt = Math.max(bridgeRetryAt, nowTs() + RATE_LIMIT_BACKOFF_MS);
+			bridgeState = "rate-limited"; updateLookupStatus();
+			throw new Error("X rate limit");
+		}
+		if (!resp.ok) throw new Error("Following lookup unavailable");
 		const body = await resp.json();
 		return {
 			users: (body.users || []).map((u) => normUser(u.screen_name || "")),
@@ -897,36 +790,20 @@
 	}
 
 	async function fetchCountryInfo(user) {
-		const host = window.location.host || "x.com";
-		const url = `https://${host}/i/api/graphql/${ABOUT_QUERY_ID}/AboutAccountQuery?variables=${encodeURIComponent(
-			JSON.stringify({ screenName: user }),
-		)}&features=${encodeURIComponent(JSON.stringify(GRAPHQL_FEATURES))}&fieldToggles=${encodeURIComponent(
-			JSON.stringify(FIELD_TOGGLES),
-		)}`;
-		try {
-			const resp = await fetch(url, {
-				credentials: "include",
-				method: "GET",
-				headers: {
-					"x-csrf-token": getCsrfToken(),
-					authorization: `Bearer ${BEARER_TOKEN}`,
-					"content-type": "application/json",
-					"x-twitter-active-user": "yes",
-					"x-twitter-auth-type": "OAuth2Session",
-					"x-twitter-client-language": navigator.language || "en",
-				},
-			});
-			const body = await resp.json();
-			const info = parseProfileFromJson(body);
-			return info.accountCountry || null;
-		} catch (e) {
-			console.warn("[XCB] fetchCountryInfo failed", user, e);
-			return null;
-		}
+		const value=await requestAbout(user);
+		const info=Helpers.classify(value.country,REGION_DEFS.map(r=>r.name));
+		config.knownUsers[user]={...info,usernameChanges:value.usernameChanges,ts:nowTs(),v:2};
+		saveKnownToDB();
+		return info.accountCountry;
 	}
 
+
 	async function analyzeFollowing(updateStatus) {
+		if(followingBusy) return;
+		followingBusy=true;
+		const button=document.getElementById("xcb-following-scan");if(button) button.disabled=true;
 		try {
+			while(fetchBusy) await new Promise(resolve=>setTimeout(resolve,100));
 			updateStatus("Fetching following list…");
 			let cursor = null;
 			const users = [];
@@ -940,8 +817,11 @@
 			const summary = {};
 			for (let i = 0; i < users.length; i += 1) {
 				const u = users[i];
-				let country = config.knownUsers[u]?.accountCountry || null;
+				let country = currentInfo(u)?.accountCountry || null;
 				if (!country) {
+					const wait=Math.max(0,nextFetchAllowed-nowTs(),bridgeRetryAt-nowTs());
+					if(wait>60000) throw new Error("X lookup cooldown is active; try later");
+					if(wait) await new Promise(resolve=>setTimeout(resolve,wait));
 					country = await fetchCountryInfo(u);
 					await new Promise((r) => setTimeout(r, FOLLOW_FETCH_DELAY));
 				}
@@ -980,7 +860,10 @@
 			updateStatus("Following analysis complete.");
 		} catch (e) {
 			console.error("[XCB] analyzeFollowing failed", e);
-			updateStatus("Following analysis failed; see console.");
+			updateStatus("Following analysis stopped: X lookup unavailable or rate-limited. Try again later.");
+		} finally {
+			followingBusy=false;if(button) button.disabled=false;
+			nextFetchAllowed=Math.max(nextFetchAllowed,nowTs()+FETCH_GAP_MS,bridgeRetryAt);
 		}
 	}
 
@@ -1015,7 +898,7 @@
 		targets.forEach((node) => {
 			const userKey = extractUsername(node);
 			if (!userKey) return;
-			const info = config.knownUsers[userKey];
+			const info = currentInfo(userKey);
 			const code = info?.accountCountry || null;
 			if (code) {
 				markChatFlag(node, userKey, code);
@@ -1207,74 +1090,9 @@
 	}
 
 	function parseProfileFromJson(obj) {
-		if (!obj || typeof obj !== "object")
-			return { accountCountry: null };
-		const result =
-			obj.user?.result ||
-			obj.user_result_by_screen_name?.result ||
-			obj.about_account?.result ||
-			obj.data?.user?.result ||
-			obj.data?.user_result_by_screen_name?.result ||
-			obj.data?.about_account?.result ||
-			obj.data?.user;
-
-		if (!result) return { accountCountry: null };
-
-		const about =
-			result.aboutModule ||
-			result.about ||
-			result.legacy?.about ||
-			result.about_account ||
-			result;
-
-		const aboutProfile =
-			result.about_profile ||
-			result.aboutProfile ||
-			result.profile ||
-			result.profile_about ||
-			{};
-
-		const accountCountryRaw =
-			about?.accountBasedIn ||
-			about?.account_based_in ||
-			about?.account_base ||
-			about?.accountCountry ||
-			aboutProfile?.account_based_in ||
-			aboutProfile?.accountBasedIn ||
-			null;
-		const accountRegionRaw =
-			about?.accountRegion ||
-			about?.account_region ||
-			aboutProfile?.account_region ||
-			aboutProfile?.accountRegion ||
-			null;
-		const usernameChangesRaw =
-			aboutProfile?.usernameChangeCount ||
-			aboutProfile?.username_changes ||
-			aboutProfile?.screen_name_change_count ||
-			about?.usernameChangeCount ||
-			about?.username_changes ||
-			about?.screen_name_change_count ||
-			result.legacy?.screen_name_change_count ||
-			null;
-
-		const accountCountry = accountCountryRaw
-			? COUNTRY_MAP[accountCountryRaw] ||
-				accountCountryRaw.slice(0, 2).toUpperCase()
-			: null;
-		const accountRegion =
-			typeof accountRegionRaw === "string" && accountRegionRaw.trim()
-				? accountRegionRaw.trim()
-				: null;
-		const usernameChanges =
-			typeof usernameChangesRaw === "number"
-				? usernameChangesRaw
-				: Number.isFinite(Number(usernameChangesRaw))
-					? Number(usernameChangesRaw)
-					: null;
-
-		return { accountCountry, accountRegion, usernameChanges };
+		return Helpers.parse(obj,REGION_DEFS.map(r=>r.name));
 	}
+
 
 	function getCsrfToken() {
 		const match = document.cookie.match(/(?:^|; )ct0=([^;]+)/);
@@ -1282,145 +1100,29 @@
 	}
 
 	function needsFetch(user) {
-		if (!user) return false;
-		if (
-			config.blockedCountries.size === 0 &&
-			config.blockedLangs.size === 0 &&
-			config.blockedRegions.size === 0 &&
-			!config.highlightRegionDisplayOnly
-		)
-			return false;
-		const known = config.knownUsers[user];
-		if (!known) return true;
-		if (known.accountCountry) return false;
-		if (known.accountRegion) {
-			if (known.ts && nowTs() - known.ts < UNKNOWN_RETRY_MS) return false;
-			return true;
-		}
-		if (known.ts && nowTs() - known.ts < UNKNOWN_RETRY_MS) return false;
-		return true;
+		return !!Core.handle(user) && (config.blockedCountries.size>0 || config.blockedRegions.size>0 || config.highlightRegionDisplayOnly) && !currentInfo(user);
 	}
-
 	function queueUser(user) {
-		const u = normUser(user);
-		if (!needsFetch(u)) return;
-		if (config.pending.has(u)) return;
-		if (fetchQueue.includes(u)) return;
-		fetchQueue.push(u);
+		const u=normUser(user);
+		if(needsFetch(u) && !config.pending.has(u) && !fetchQueue.includes(u) && fetchQueue.length<300) fetchQueue.push(u);
 	}
-
 	function fetchCountry(username) {
-		const user = normUser(username);
-		if (!user) return false;
-
-		const known = config.knownUsers[user];
-		if (known) {
-			if (known.accountCountry) return;
-			if (known.ts && nowTs() - known.ts < UNKNOWN_RETRY_MS) return;
-		}
-		if (config.pending.has(user)) return false;
-
-		// Avoid hammering if nothing to block
-		if (
-			config.blockedCountries.size === 0 &&
-			config.blockedLangs.size === 0 &&
-			config.blockedRegions.size === 0 &&
-			!config.highlightRegionDisplayOnly
-		)
-			return false;
-
-		// Respect global throttle
-		const now = nowTs();
-		if (now < nextFetchAllowed) {
-			// schedule retry later by stamping ts to avoid tight loop
-			config.knownUsers[user] = {
-				accountCountry: null,
-				ts: now,
-			};
-			return false;
-		}
-
-		config.pending.add(user);
-		console.log("[XCB] fetching about page for", user);
-		const host = window.location.host || "x.com";
-		const url = `https://${host}/i/api/graphql/${ABOUT_QUERY_ID}/AboutAccountQuery?variables=${encodeURIComponent(
-			JSON.stringify({ screenName: user }),
-		)}&features=${encodeURIComponent(JSON.stringify(GRAPHQL_FEATURES))}&fieldToggles=${encodeURIComponent(
-			JSON.stringify(FIELD_TOGGLES),
-		)}`;
-
-		fetch(url, {
-			credentials: "include",
-			method: "GET",
-			headers: {
-				"x-csrf-token": getCsrfToken(),
-				authorization: `Bearer ${BEARER_TOKEN}`,
-				"content-type": "application/json",
-				"x-twitter-active-user": "yes",
-				"x-twitter-auth-type": "OAuth2Session",
-				"x-twitter-client-language": navigator.language || "en",
-				"x-client-transaction-id": Math.random().toString(36).slice(2, 10),
-				referer: `https://${host}/${user}`,
-			},
-		})
-			.then((resp) =>
-				resp
-					.json()
-					.then((body) => ({ status: resp.status, body }))
-					.catch(() => ({ status: resp.status, body: {} })),
-			)
-			.then(({ status, body }) => {
-				if (status === 429) {
-					nextFetchAllowed = Math.max(
-						nextFetchAllowed,
-						nowTs() + RATE_LIMIT_BACKOFF_MS,
-					);
-					config.pending.delete(user);
-					queueUser(user);
-					return;
-				}
-				if (status >= 400) {
-					console.warn("[XCB] about query failed", status, body?.errors);
-					config.pending.delete(user);
-					return;
-				}
-				const info = parseProfileFromJson(body);
-				console.log("[XCB] about json", user, info);
-				if (!info.accountCountry && !info.accountRegion) {
-					config.knownUsers[user] = {
-						accountCountry: null,
-						accountRegion: info.accountRegion || null,
-						usernameChanges: info.usernameChanges ?? null,
-						ts: nowTs(),
-					};
-					save();
-					return;
-				}
-				config.knownUsers[user] = {
-					accountCountry: info.accountCountry || null,
-					accountRegion: info.accountRegion || null,
-					usernameChanges: info.usernameChanges ?? null,
-					ts: nowTs(),
-				};
-				saveKnownToDB(user, config.knownUsers[user]);
-				if (info.accountCountry) {
-					const code = info.accountCountry;
-					if (!config.countryDB[code]) config.countryDB[code] = [];
-					if (!config.countryDB[code].includes(user))
-						config.countryDB[code].push(user);
-					if (config.blockedCountries.has(code)) scanAndHide();
-				}
-				save();
-			})
-			.catch((err) => {
-				console.error("[XCB] fetch about failed", user, err);
-			})
-			.finally(() => {
-				config.pending.delete(user);
-				nextFetchAllowed = Math.max(nextFetchAllowed, nowTs() + FETCH_GAP_MS);
-			});
+		const user=normUser(username);
+		if(!needsFetch(user) || fetchBusy || followingBusy || config.pending.has(user) || nowTs()<Math.max(nextFetchAllowed,bridgeRetryAt)) return false;
+		fetchBusy=true;config.pending.add(user);
+		requestAbout(user).then(value=> {
+			const info=Helpers.classify(value.country,REGION_DEFS.map(r=>r.name));
+			config.knownUsers[user]={...info,usernameChanges:value.usernameChanges,ts:nowTs(),v:2};
+			saveKnownToDB();safeScan();
+		}).catch(()=> {
+			// Do not cache transport/auth/endpoint failures as unknown locations.
+		}).finally(()=> {
+			config.pending.delete(user);fetchBusy=false;
+			nextFetchAllowed=Math.max(nowTs()+FETCH_GAP_MS,bridgeRetryAt);
+		});
 		return true;
 	}
+
 
 	function scanAndHide() {
 		document
@@ -1428,6 +1130,16 @@
 			.forEach((tweet) => {
 				const userKey = extractUsername(tweet);
 				if (!userKey) return;
+				const own=Core.handle(document.querySelector('a[data-testid="AppTabBar_Profile_Link"]')?.getAttribute("href")?.split("/")[1]);
+				const statusLink=[...tweet.querySelectorAll('a[href]')].find(a=>a.querySelector("time") && new URL(a.href,location.origin).pathname.startsWith("/"+userKey+"/status/"));
+				const postKey=userKey+":"+(statusLink?.getAttribute("href") || "");
+				if(tweet.dataset.xcbPostKey!==postKey) {
+					clearFilterMark(tweet);
+					const footer=document.getElementById(tweet.dataset.xcbFooterId || "");if(footer) footer.remove();
+					for(const key of ["xcbFooterId","xcbFooterContent","xcbCounted","xcbSeenCounted"]) delete tweet.dataset[key];
+					tweet.dataset.xcbPostKey=postKey;
+				}
+				if(userKey===own) {clearFilterMark(tweet);return;}
 
 				const text =
 					tweet.querySelector('[data-testid="tweetText"]')?.textContent ||
@@ -1435,7 +1147,7 @@
 					"";
 				const langMatch = hasBlockedLang(text);
 				let reason = langMatch ? `Lang:${langMatch}` : "";
-				const userInfo = config.knownUsers[userKey];
+				const userInfo = currentInfo(userKey);
 				const accountCountry = userInfo?.accountCountry || null;
 				let countryCode = null;
 				let regionName =
@@ -1469,7 +1181,7 @@
 					queueUser(userKey);
 				}
 				renderFlag(tweet, accountCountry || null);
-				renderFooterInfo(tweet, accountCountry || null, userInfo?.usernameChanges);
+				renderFooterInfo(tweet, accountCountry || null, userInfo?.usernameChanges, userInfo?.accountRegion);
 				if (!reason && (tweet.dataset.xcbMode || tweet.dataset.blocked)) {
 					clearFilterMark(tweet);
 				}
@@ -1495,8 +1207,10 @@
 	}
 
 	function processQueue() {
+		updateLookupStatus();
+		if(fetchBusy || followingBusy) return;
 		const now = nowTs();
-		if (now < nextFetchAllowed) return;
+		if (now < Math.max(nextFetchAllowed,bridgeRetryAt)) return;
 		let processed = 0;
 		while (fetchQueue.length && processed < PREFETCH_BATCH) {
 			const user = fetchQueue.shift();
@@ -1586,8 +1300,9 @@
 		modal.style =
 			"display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;align-items:center;justify-content:center;";
 		modal.innerHTML = `<div style="background:#15202b;color:#fff;padding:20px;border-radius:12px;max-width:480px;width:92%;max-height:90vh;overflow:auto;box-shadow:0 10px 30px rgba(0,0,0,0.35);">
-            <h2 style="margin:0 0 16px;text-align:center;">X Country & Language Blocker</h2>
-            <div style="font-size:13px;color:#aab8c2;margin-bottom:12px;text-align:center;">Add countries or language scripts to hide or highlight matching posts. Counts show S: this session, T: total (saved).</div>
+            <h2 style="margin:0 0 16px;text-align:center;">CleanX Local</h2>
+            <div id="xcb-lookup-status" role="status" style="font-size:12px;color:#aab8c2;margin-bottom:10px;text-align:center;">Connecting to X…</div>
+            <div style="font-size:13px;color:#aab8c2;margin-bottom:12px;text-align:center;">Uses X’s estimated account location. Broad region labels stay regions; unknown locations remain visible. Script filters match characters, not nationality. Counts: S = this session, T = total.</div>
             <div style="margin:10px 0 14px;">
               <strong>Filtered post behavior</strong>
               <div id="xcb-mode-row" style="display:flex;gap:12px;flex-wrap:wrap;margin-top:6px;font-size:13px;">
@@ -1599,14 +1314,15 @@
             <input id="add-c" placeholder="Add country (e.g. Israel or IL)" style="width:100%;padding:8px;margin:8px 0;border-radius:8px;">
             <strong>Regions</strong><div id="list-r" style="max-height:200px;overflow:auto;margin:8px 0;padding:8px;background:#0002;border-radius:8px;"></div>
             <input id="add-r" placeholder="Add region (e.g. Middle East and North Africa)" style="width:100%;padding:8px;margin:8px 0;border-radius:8px;">
-            <strong>Languages</strong><div id="list-l" style="max-height:200px;overflow:auto;margin:8px 0;padding:8px;background:#0002;border-radius:8px;"></div>
-            <input id="add-l" placeholder="Add language (e.g. ar)" style="width:100%;padding:8px;margin:8px 0;border-radius:8px;">
+            <strong>Writing scripts</strong><div id="list-l" style="max-height:200px;overflow:auto;margin:8px 0;padding:8px;background:#0002;border-radius:8px;"></div>
+            <input id="add-l" placeholder="Add script filter (e.g. ar)" style="width:100%;padding:8px;margin:8px 0;border-radius:8px;">
             <div id="xcb-blocked-count" style="margin:8px 0;font-size:13px;color:#d9d9d9;">Filtered this session: 0</div>
             <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0;"><input type="checkbox" id="xcb-highlight-region-only"> Highlight accounts showing region-only (yellow)</label>
             <div id="xcb-analytics" style="margin:10px 0;font-size:13px;color:#aab8c2;">Seen stats loading…</div>
             <button id="xcb-following-scan" style="width:100%;padding:10px;background:#273340;border:none;border-radius:8px;color:#fff;margin-top:8px;cursor:pointer;">Analyze Following (country breakdown)</button>
             <div id="xcb-following-status" style="margin:6px 0;font-size:12px;color:#aab8c2;"></div>
             <div id="xcb-following-report" style="max-height:180px;overflow:auto;padding:8px;background:#0002;border-radius:8px;font-size:12px;color:#e7e9ea;"></div>
+            <button id="xcb-clear-cache" style="width:100%;padding:10px;background:#273340;border:none;border-radius:8px;color:#fff;margin-top:12px;cursor:pointer;">Refresh location cache</button>
             <button id="export-db" style="width:100%;padding:10px;background:#273340;border:none;border-radius:8px;color:#fff;margin-top:12px;cursor:pointer;">Export DB (JSON)</button>
             <button id="close" style="width:100%;padding:10px;background:#1d9bf0;border:none;border-radius:8px;color:#fff;margin-top:12px;cursor:pointer;">Close</button>
         </div>`;
@@ -1803,6 +1519,10 @@
 			if (e.key === "Escape") closeModal();
 		});
 		document.getElementById("close").onclick = () => closeModal();
+		updateLookupStatus();
+		document.getElementById("xcb-clear-cache").onclick = () => {
+			config.knownUsers=Object.create(null);config.countryDB={};save();safeScan();setStatus("Location cache cleared. Visible accounts will be checked again.");
+		};
 		document.getElementById("export-db").onclick = () => {
 			setStatus("DB exported to console");
 			console.log("XCB DB", exportDB());
@@ -1884,9 +1604,13 @@
 		}
 	}
 
-	Promise.all([loadKnownFromDB(), loadTotalsFromDB()]).finally(() => start());
+	load().then(()=> {
+		postBridge({type:"config",active:true});start();
+	}).catch(()=> {
+		start();const show=()=> {const el=document.getElementById("xcb-status");if(el) el.textContent="Could not load saved settings.";};setTimeout(show,2000);
+	});
 
 	console.log(
-		"X Country Blocker v5.1 (CLEAN) ready — nothing blocked until you add it",
+		"CleanX Local 1.1 ready — nothing blocked until you add it",
 	);
 })();

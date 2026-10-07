@@ -1,17 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "CleanX",
-  "description": "Filter X/Twitter posts by country, region, or language with optional highlighting.",
-  "version": "1.0.0",
+  "name": "CleanX Local",
+  "description": "Locally modified CleanX: country, region and script filters with private local storage and safer lookups.",
+  "version": "1.1.0",
+  "minimum_chrome_version": "111",
   "permissions": ["storage"],
   "content_scripts": [
-    {
-      "matches": [
-        "https://x.com/*",
-        "https://twitter.com/*"
-      ],
-      "js": ["content.js"],
-      "run_at": "document_start"
-    }
+    { "matches": ["https://x.com/*", "https://twitter.com/*"], "js": ["core.js", "bridge.js"], "run_at": "document_start", "world": "MAIN" },
+    { "matches": ["https://x.com/*", "https://twitter.com/*"], "js": ["core.js", "helpers.js", "content.js"], "run_at": "document_start" }
   ]
 }
