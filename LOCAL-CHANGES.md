@@ -15,6 +15,7 @@ This is a local modification of the **Chrome extension**. The upstream userscrip
 ## Changes
 
 - Exact country recognition. Broad `Account based in` region labels remain regions; unknown labels no longer become two-letter country codes.
+- Version 1.1.1 bundles each Chrome execution world into a single readable file (`page.js` and `cleanx.js`). This fixes the real Manifest V3 startup failure where the content script could not see its country catalog. Browser bundles keep their helpers in a private closure, independent of page globals or CommonJS module detection.
 - Confirmed countries and regions expire after 24 hours; empty results after 10 minutes. Maximum 2,000 cached authors. Old upstream cache records are not reused.
 - Preferences, cached public labels, and statistics use `chrome.storage.local`, rather than X’s localStorage or IndexedDB. X page scripts cannot read the extension’s storage. No automatic migration of old site data.
 - About-account credentials stay in page memory. No credentials are persisted or passed to the content script. The bridge observes X’s own authorization headers and sends only public location labels and username-change counts back.
@@ -32,7 +33,7 @@ The page-world bridge does not protect against a malicious X page or another ext
 
 Use one X tab while populating the cache: throttling is per tab, and statistics/settings are saved by the active tab. The following-list feature still reads X’s same-origin friends API using its public web-client bearer and the page’s CSRF token. It never changes the account.
 
-Run `node --test tests/*.test.cjs` from this checkout. Browser integration uses `node tests/browser.cjs` with Playwright and `BROWSER_EXECUTABLE` pointing to a Chromium browser. Tests fulfill all X responses locally and never use real account cookies. Live authenticated X compatibility still needs verification after installation.
+After source edits, run `node scripts/build.cjs` to regenerate the checked-in browser bundles. Run `node --test tests/*.test.cjs` from this checkout. Browser integration uses `node tests/browser.cjs`; actual Manifest V3 injection is tested by `node tests/manifest-browser.cjs`. Both require Playwright and `BROWSER_EXECUTABLE` pointing to a Chromium browser. Tests fulfill all X responses locally and never use real account cookies. Version 1.1.1 was verified on a live, authenticated X timeline: the sidebar and settings loaded, the session connected, and country/region labels were retrieved and used for temporary highlighting. The test filter was removed afterward.
 
 ## GitHub fork
 
