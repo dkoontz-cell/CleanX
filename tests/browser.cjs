@@ -24,7 +24,7 @@ function state(extra={}) {
     await storage(context,state());
     await context.route('**/*',route=>route.request().url()==='https://x.com/home'?route.fulfill({contentType:'text/html',body:html(tweet('blocked',100,'India fixture')+tweet('broad',101,'South Asia fixture')+tweet('local',102,'US fixture')+tweet('myself',103,'Own fixture')+tweet('stale',104,'Expired fixture'))}):route.abort());
     const page=await context.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.goto('https://x.com/home');
-    for(const file of ['core.js','helpers.js','bridge.js','content.js']) await page.addScriptTag({content:read(file)});
+    for(const file of ['page.js','cleanx.js']) await page.addScriptTag({content:read(file)});
     await page.waitForSelector('#xcb-button',{timeout:8000}).catch(async error=> {console.error('Page errors:',errors);console.error(await page.locator('body').innerText());throw error;});
     assert.equal(await page.locator('article[data-blocked="1"]').count(),2);
     assert.equal(await page.getByText('Own fixture',{exact:true}).isVisible(),true);
@@ -69,7 +69,7 @@ function state(extra={}) {
       return route.abort();
     });
     const p=await lookup.newPage();p.on('pageerror',e=>errors.push(e.message));await p.goto('https://x.com/home');
-    for(const file of ['core.js','helpers.js','bridge.js','content.js'])await p.addScriptTag({content:read(file)});
+    for(const file of ['page.js','cleanx.js'])await p.addScriptTag({content:read(file)});
     await p.evaluate(()=>fetch('/i/api/graphql/fixture/HomeTimeline',{headers:{authorization:'Bearer fixture-session'}}));
     await p.waitForSelector('article[data-blocked="1"]',{state:'attached'});
     await p.waitForFunction(()=>window.__stored.xCountryBlocker.knownUsers.author?.accountCountry==='IN');
