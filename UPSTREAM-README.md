@@ -1,10 +1,4 @@
-## CleanX Local
-
-This checkout contains a locally modified **Chrome extension** based on theesfeld/CleanX, with upstream Git history preserved. See [LOCAL-CHANGES.md](LOCAL-CHANGES.md) for installation, fixes, privacy details, tests, and how to connect a GitHub fork. Load the `extension/` folder. The original userscript is unchanged.
-
-The upstream README follows below; its IndexedDB/localStorage notes describe the original version, not this local extension.
-
-## CleanX (upstream)
+## CleanX
 
 Personal userscript (and Chrome extension) for X/Twitter that filters posts by country, region, or language with optional highlighting.
 
